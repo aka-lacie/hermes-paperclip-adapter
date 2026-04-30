@@ -81,14 +81,23 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
     const trimmed = line.trimEnd();
     const indent = line.length - line.trimStart().length;
 
-    // Track model: section (indent 0)
+    // Track top-level keys
+    if (indent === 0) {
+      const topMatch = trimmed.match(/^([\w_]+)\s*:\s*(.+)$/);
+      if (topMatch) {
+        const key = topMatch[1];
+        const val = topMatch[2].trim().replace(/#.*$/, "").trim().replace(/^['"]|['"]$/g, "");
+        continue;
+      }
+    }
+
+    // Track model: section
     if (/^model:\s*$/.test(trimmed) && indent === 0) {
       inModelSection = true;
       modelSectionIndent = 0;
       continue;
     }
 
-    // We left the model section if indent drops back to the section level or below
     if (inModelSection && indent <= modelSectionIndent && trimmed && !trimmed.startsWith("#")) {
       inModelSection = false;
     }
@@ -107,7 +116,6 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
   }
 
   if (!model) return null;
-
   return { model, provider, baseUrl, apiMode, source: "config" };
 }
 

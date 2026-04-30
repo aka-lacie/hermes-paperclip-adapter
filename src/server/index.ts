@@ -107,6 +107,8 @@ export function createServerAdapter(): ServerAdapterModule & {
     agentConfigurationDoc,
     detectModel: () => detectModel(),
     supportsLocalAgentJwt: true,
+    // @ts-ignore
+    supportsInstructionsBundle: true,
 
     async getConfigSchema(): Promise<AdapterConfigSchema> {
       const profiles = await listProfiles();
