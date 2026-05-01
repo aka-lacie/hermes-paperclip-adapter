@@ -122,6 +122,16 @@ async function buildSkillEntry(
   };
 }
 
+async function resolvePaperclipHermesSkillName(runtimeName: string, source: string): Promise<string> {
+  try {
+    const content = await fs.readFile(path.join(source, "SKILL.md"), "utf8");
+    const fm = parseSkillFrontmatter(content);
+    return asString(fm.name) ?? runtimeName;
+  } catch {
+    return runtimeName;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -147,9 +157,10 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
   // Paperclip-managed skills
   for (const entry of paperclipEntries) {
     const desired = desiredSet.has(entry.key);
+    const hermesSkillName = await resolvePaperclipHermesSkillName(entry.runtimeName, entry.source);
     entries.push({
       key: entry.key,
-      runtimeName: entry.runtimeName,
+      runtimeName: hermesSkillName,
       desired,
       managed: true,
       state: desired ? "configured" : "available",
@@ -159,7 +170,7 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
       sourcePath: entry.source,
       targetPath: null,
       detail: desired
-        ? "Will be available on the next run via Hermes skill loading."
+        ? "Will be materialized into the Paperclip-managed Hermes skill bundle on the next run."
         : null,
       required: Boolean(entry.required),
       requiredReason: entry.requiredReason ?? null,

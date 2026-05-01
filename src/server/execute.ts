@@ -31,6 +31,9 @@ import {
   ensureAbsoluteDirectory,
   appendWithCap,
   runningProcesses,
+  readPaperclipRuntimeSkillEntries,
+  resolvePaperclipDesiredSkillNames,
+  type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -61,7 +64,11 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as nodePath from "node:path";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __moduleDir = nodePath.dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -80,6 +87,222 @@ function cfgStringArray(v: unknown): string[] | undefined {
   return Array.isArray(v) && v.every((i) => typeof i === "string")
     ? (v as string[])
     : undefined;
+}
+
+function parseSkillNameFromMarkdown(content: string): string | null {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return null;
+  for (const line of match[1].split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    if (line.slice(0, idx).trim() !== "name") continue;
+    const value = line.slice(idx + 1).trim();
+    if (!value) return null;
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      return value.slice(1, -1).trim() || null;
+    }
+    return value;
+  }
+  return null;
+}
+
+async function resolveHermesSkillName(entry: PaperclipSkillEntry): Promise<string> {
+  const markdown = await fs.readFile(nodePath.join(entry.source, "SKILL.md"), "utf8").catch(() => "");
+  return parseSkillNameFromMarkdown(markdown) ?? entry.runtimeName;
+}
+
+async function hashPathContents(
+  candidate: string,
+  hash: ReturnType<typeof createHash>,
+  relativePath: string,
+  seenDirectories: Set<string>,
+): Promise<void> {
+  const stat = await fs.lstat(candidate);
+  if (stat.isSymbolicLink()) {
+    const realPath = await fs.realpath(candidate);
+    await hashPathContents(realPath, hash, relativePath, seenDirectories);
+    return;
+  }
+  if (stat.isDirectory()) {
+    const realDir = await fs.realpath(candidate).catch(() => candidate);
+    if (seenDirectories.has(realDir)) {
+      hash.update(`loop:${relativePath}\n`);
+      return;
+    }
+    seenDirectories.add(realDir);
+    hash.update(`dir:${relativePath}\n`);
+    const entries = await fs.readdir(candidate, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const childRelative = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+      await hashPathContents(nodePath.join(candidate, entry.name), hash, childRelative, seenDirectories);
+    }
+    return;
+  }
+  if (stat.isFile()) {
+    hash.update(`file:${relativePath}\n`);
+    hash.update(await fs.readFile(candidate));
+    hash.update("\n");
+    return;
+  }
+  hash.update(`other:${relativePath}:${stat.mode}\n`);
+}
+
+function resolvePaperclipHome(): string {
+  return nodePath.resolve(process.env.PAPERCLIP_HOME ?? nodePath.join(homedir(), ".paperclip"));
+}
+
+function resolvePaperclipInstanceId(): string {
+  return cfgString(process.env.PAPERCLIP_INSTANCE_ID) ?? "default";
+}
+
+function yamlQuote(value: string): string {
+  return JSON.stringify(value);
+}
+
+function upsertHermesExternalDirs(configContent: string, externalDirs: string[]): string {
+  const lines = configContent.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const skillsIndex = lines.findIndex((line) => /^skills:\s*$/.test(line));
+  const externalLines = [
+    "  external_dirs:",
+    ...externalDirs.map((dir) => `  - ${yamlQuote(dir)}`),
+  ];
+
+  if (skillsIndex < 0) {
+    return [...lines, "skills:", ...externalLines, ""].join("\n");
+  }
+
+  let skillsEnd = skillsIndex + 1;
+  while (skillsEnd < lines.length && (/^\s/.test(lines[skillsEnd]) || lines[skillsEnd].trim() === "")) {
+    skillsEnd += 1;
+  }
+
+  let externalStart = -1;
+  let externalEnd = -1;
+  for (let index = skillsIndex + 1; index < skillsEnd; index += 1) {
+    if (/^\s{2}external_dirs:\s*(?:\[.*\])?\s*$/.test(lines[index])) {
+      externalStart = index;
+      externalEnd = index + 1;
+      while (
+        externalEnd < skillsEnd &&
+        (/^\s{4,}/.test(lines[externalEnd]) || /^\s{2}-\s/.test(lines[externalEnd]) || lines[externalEnd].trim() === "")
+      ) {
+        externalEnd += 1;
+      }
+      break;
+    }
+  }
+
+  if (externalStart >= 0) {
+    lines.splice(externalStart, externalEnd - externalStart, ...externalLines);
+  } else {
+    lines.splice(skillsIndex + 1, 0, ...externalLines);
+  }
+  return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
+}
+
+async function writeFileIfChanged(filePath: string, content: string): Promise<boolean> {
+  const existing = await fs.readFile(filePath, "utf8").catch(() => null);
+  if (existing === content) return false;
+  await fs.mkdir(nodePath.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempPath, content, "utf8");
+  await fs.rename(tempPath, filePath);
+  return true;
+}
+
+async function prepareHermesPaperclipSkillBundle(
+  onLog: AdapterExecutionContext["onLog"],
+  options: {
+    companyId: string;
+    agentId: string;
+    hermesHome: string;
+    skillsEntries: PaperclipSkillEntry[];
+    desiredSkillNames: string[];
+  },
+): Promise<string | null> {
+  const desiredSet = new Set(options.desiredSkillNames);
+  const selectedEntries = options.skillsEntries.filter((entry) => desiredSet.has(entry.key));
+  if (selectedEntries.length === 0) return null;
+
+  const prepared = [];
+  for (const entry of selectedEntries) {
+    prepared.push({
+      entry,
+      skillName: await resolveHermesSkillName(entry),
+    });
+  }
+
+  const seenSkillNames = new Set<string>();
+  const uniquePrepared = prepared.filter(({ skillName }) => {
+    if (seenSkillNames.has(skillName)) return false;
+    seenSkillNames.add(skillName);
+    return true;
+  });
+
+  const hash = createHash("sha256");
+  hash.update("paperclip-hermes-skill-bundle:v1\n");
+  uniquePrepared.sort((left, right) => left.entry.key.localeCompare(right.entry.key));
+  for (const { entry, skillName } of uniquePrepared) {
+    hash.update(`skill:${entry.key}:${entry.runtimeName}:${skillName}\n`);
+    await hashPathContents(entry.source, hash, skillName, new Set());
+  }
+
+  const bundleHash = hash.digest("hex");
+  const bundleRoot = nodePath.join(
+    resolvePaperclipHome(),
+    "instances",
+    resolvePaperclipInstanceId(),
+    "companies",
+    options.companyId,
+    "hermes-skill-bundles",
+    options.agentId,
+    bundleHash,
+  );
+
+  const markerPath = nodePath.join(bundleRoot, ".paperclip-hermes-skill-bundle.json");
+  const existingMarker = await fs.stat(markerPath).then((stats) => stats.isFile()).catch(() => false);
+  if (!existingMarker) {
+    const tempRoot = `${bundleRoot}.${process.pid}.${Date.now()}.tmp`;
+    await fs.rm(tempRoot, { recursive: true, force: true });
+    await fs.mkdir(tempRoot, { recursive: true });
+    for (const { entry, skillName } of uniquePrepared) {
+      await fs.cp(entry.source, nodePath.join(tempRoot, skillName), {
+        recursive: true,
+        dereference: true,
+        force: true,
+      });
+    }
+    await fs.writeFile(
+      nodePath.join(tempRoot, ".paperclip-hermes-skill-bundle.json"),
+      JSON.stringify({
+        version: 1,
+        companyId: options.companyId,
+        agentId: options.agentId,
+        skills: uniquePrepared.map(({ entry, skillName }) => ({
+          key: entry.key,
+          runtimeName: entry.runtimeName,
+          name: skillName,
+          source: entry.source,
+        })),
+      }, null, 2),
+      "utf8",
+    );
+    await fs.rm(bundleRoot, { recursive: true, force: true });
+    await fs.rename(tempRoot, bundleRoot);
+    await onLog("stdout", `[paperclip] Prepared Hermes Paperclip skill bundle with ${uniquePrepared.length} skills at ${bundleRoot}\n`);
+  }
+
+  const configPath = nodePath.join(options.hermesHome, "config.yaml");
+  const currentConfig = await fs.readFile(configPath, "utf8").catch(() => "");
+  const nextConfig = upsertHermesExternalDirs(currentConfig, [bundleRoot]);
+  const changed = await writeFileIfChanged(configPath, nextConfig);
+  if (changed) {
+    await onLog("stdout", `[paperclip] Updated Hermes profile skills.external_dirs for Paperclip bundle: ${bundleRoot}\n`);
+  }
+
+  return bundleRoot;
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1115,7 @@ export async function execute(
     ...(process.env as Record<string, string>),
     ...buildPaperclipEnv(ctx.agent),
   };
+  let effectiveHermesHome = nodePath.join(homedir(), ".hermes");
 
   // Profile: -p is a global flag (must come before subcommand would,
   // but hermes chat also accepts it as a passthrough via extra position).
@@ -902,6 +1126,7 @@ export async function execute(
     const profilePath = await ensureProfile(profileName);
     if (profilePath) {
       env.HERMES_HOME = profilePath;
+      effectiveHermesHome = profilePath;
       await ctx.onLog(
         "stdout",
         `[hermes] Using profile: ${profileName} (${profilePath})\n`,
@@ -913,6 +1138,16 @@ export async function execute(
       );
     }
   }
+
+  const paperclipSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  const desiredSkillNames = resolvePaperclipDesiredSkillNames(config, paperclipSkillEntries);
+  await prepareHermesPaperclipSkillBundle(ctx.onLog, {
+    companyId: ctx.agent?.companyId ?? "unknown-company",
+    agentId: ctx.agent?.id ?? "unknown-agent",
+    hermesHome: effectiveHermesHome,
+    skillsEntries: paperclipSkillEntries,
+    desiredSkillNames,
+  });
 
   // When a profile is set and no explicit model/provider is in adapterConfig,
   // let Hermes use its own config.yaml (which we already detected from).
