@@ -24,7 +24,7 @@ export const DEFAULT_GRACE_SEC = 10;
 export const DEFAULT_IDLE_TIMEOUT_SEC = 120;
 
 /** Default model to use if none specified. */
-export const DEFAULT_MODEL = "anthropic/claude-sonnet-4";
+export const DEFAULT_MODEL = "gpt-5.5";
 
 /**
  * Valid --provider choices for the hermes CLI.
