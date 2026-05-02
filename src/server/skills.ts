@@ -7,12 +7,22 @@ import type {
   AdapterSkillSnapshot,
 } from "@paperclipai/adapter-utils";
 import {
-  readPaperclipRuntimeSkillEntries,
   resolvePaperclipDesiredSkillNames,
+  type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { fileURLToPath } from "node:url";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const PAPERCLIP_CORE_SKILL_ROOT_RELATIVE_CANDIDATES = [
+  "../../skills",
+  "../../../../../skills",
+];
+const PAPERCLIP_SERVER_SKILLS_RELATIVE_CANDIDATES = [
+  "node_modules/@paperclipai/server/skills",
+  "../server/skills",
+  "../../server/skills",
+];
+const DEFAULT_WORKSPACE_SKILLS_DIR = "/srv/paperclip/repo/skills";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -29,6 +39,33 @@ function resolveHermesHome(config: Record<string, unknown>): string {
       : {};
   const configuredHome = asString(env.HOME);
   return configuredHome ? path.resolve(configuredHome) : os.homedir();
+}
+
+function configuredStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+
+function uniquePaths(candidates: Array<string | null | undefined>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === "string" ? candidate.trim() : "";
+    if (!trimmed) continue;
+    const resolved = path.resolve(trimmed);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    out.push(resolved);
+  }
+  return out;
+}
+
+function resolveWorkspaceDir(config: Record<string, unknown>): string | null {
+  return (
+    asString(config.workspaceDir) ??
+    asString(config.cwd) ??
+    asString(process.env.PAPERCLIP_WORKSPACE_DIR) ??
+    path.dirname(DEFAULT_WORKSPACE_SKILLS_DIR)
+  );
 }
 
 interface SkillFrontmatter {
@@ -122,6 +159,188 @@ async function buildSkillEntry(
   };
 }
 
+async function isDirectory(candidate: string): Promise<boolean> {
+  return fs.stat(candidate).then((stats) => stats.isDirectory()).catch(() => false);
+}
+
+async function resolveFirstExistingDirectory(candidates: string[]): Promise<string | null> {
+  for (const candidate of candidates) {
+    if (await isDirectory(candidate)) return candidate;
+  }
+  return null;
+}
+
+function configuredRuntimeSkillEntries(config: Record<string, unknown>): PaperclipSkillEntry[] {
+  const raw = config.paperclipRuntimeSkills;
+  if (!Array.isArray(raw)) return [];
+  const out: PaperclipSkillEntry[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const entry = item as Record<string, unknown>;
+    const key = asString(entry.key) ?? asString(entry.name);
+    const runtimeName = asString(entry.runtimeName) ?? asString(entry.name);
+    const source = asString(entry.source);
+    if (!key || !runtimeName || !source) continue;
+    out.push({
+      key,
+      runtimeName,
+      source: path.resolve(source),
+      required: entry.required === true,
+      requiredReason: asString(entry.requiredReason),
+    });
+  }
+  return out;
+}
+
+function coreSkillRootCandidates(
+  config: Record<string, unknown>,
+  moduleDir: string,
+  _companyId?: string | null,
+): string[] {
+  return uniquePaths([
+    asString(config.paperclipCoreSkillsDir),
+    asString(process.env.PAPERCLIP_CORE_SKILLS_DIR),
+    ...configuredStringArray(config.paperclipCoreSkillDirs),
+    ...PAPERCLIP_CORE_SKILL_ROOT_RELATIVE_CANDIDATES.map((relative) => path.resolve(moduleDir, relative)),
+    ...PAPERCLIP_SERVER_SKILLS_RELATIVE_CANDIDATES.map((relative) => path.resolve(process.cwd(), relative)),
+    ...PAPERCLIP_SERVER_SKILLS_RELATIVE_CANDIDATES.map((relative) => path.resolve(os.homedir(), relative)),
+    path.join(os.homedir(), ".npm-global/lib/node_modules/paperclipai/node_modules/@paperclipai/server/skills"),
+    path.join(os.homedir(), ".npm-global/lib/node_modules/@paperclipai/server/skills"),
+  ]);
+}
+
+function workspaceSkillRootCandidates(config: Record<string, unknown>): string[] {
+  const workspaceDir = resolveWorkspaceDir(config);
+  return uniquePaths([
+    asString(config.paperclipWorkspaceSkillsDir),
+    asString(config.workspaceSkillsDir),
+    asString(process.env.PAPERCLIP_WORKSPACE_SKILLS_DIR),
+    ...configuredStringArray(config.paperclipWorkspaceSkillDirs),
+    workspaceDir ? path.join(workspaceDir, "skills") : null,
+    DEFAULT_WORKSPACE_SKILLS_DIR,
+  ]);
+}
+
+async function listFlatSkillEntries(options: {
+  root: string;
+  keyPrefix: string;
+  required: boolean;
+  requiredReason?: string | null;
+}): Promise<PaperclipSkillEntry[]> {
+  const entries = await fs.readdir(options.root, { withFileTypes: true }).catch(() => []);
+  const out: PaperclipSkillEntry[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+    if (entry.name.startsWith(".")) continue;
+    const source = path.join(options.root, entry.name);
+    const skillMdPath = path.join(source, "SKILL.md");
+    const hasSkill = await fs.stat(skillMdPath).then((stats) => stats.isFile()).catch(() => false);
+    if (!hasSkill) continue;
+    out.push({
+      key: `${options.keyPrefix}/${entry.name}`,
+      runtimeName: entry.name,
+      source,
+      required: options.required,
+      requiredReason: options.required ? options.requiredReason ?? null : null,
+    });
+  }
+  return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function isCorePaperclipEntry(entry: PaperclipSkillEntry): boolean {
+  const normalizedSource = entry.source.replaceAll("\\", "/");
+  return (
+    normalizedSource.endsWith("/@paperclipai/server/skills") ||
+    normalizedSource.includes("/@paperclipai/server/skills/") ||
+    normalizedSource.includes("/node_modules/paperclipai/node_modules/@paperclipai/server/skills/") ||
+    entry.key.startsWith("paperclipai/paperclip/")
+  );
+}
+
+function dedupeSkillEntries(entries: PaperclipSkillEntry[]): PaperclipSkillEntry[] {
+  const byKey = new Map<string, PaperclipSkillEntry>();
+  const seenRuntimeNames = new Set<string>();
+  for (const entry of entries) {
+    if (byKey.has(entry.key) || seenRuntimeNames.has(entry.runtimeName)) continue;
+    byKey.set(entry.key, entry);
+    seenRuntimeNames.add(entry.runtimeName);
+  }
+  return Array.from(byKey.values()).sort((a, b) => a.key.localeCompare(b.key));
+}
+
+export async function readHermesPaperclipSkillEntries(
+  config: Record<string, unknown>,
+  moduleDir: string = __moduleDir,
+  options: { companyId?: string | null } = {},
+): Promise<PaperclipSkillEntry[]> {
+  const configuredEntries = configuredRuntimeSkillEntries(config);
+  const configuredCoreEntries = configuredEntries
+    .filter(isCorePaperclipEntry)
+    .map((entry) => ({
+      ...entry,
+      key: entry.key.startsWith("paperclipai/paperclip/")
+        ? entry.key
+        : `paperclipai/paperclip/${entry.runtimeName}`,
+      required: true,
+      requiredReason: entry.requiredReason ?? "Bundled Paperclip skills are always available for local adapters.",
+    }));
+
+  const configuredWorkspaceEntries = configuredEntries
+    .filter((entry) => !isCorePaperclipEntry(entry))
+    .map((entry) => ({
+      ...entry,
+      key: entry.key.startsWith("paperclipai/workspace/")
+        ? entry.key
+        : `paperclipai/workspace/${entry.runtimeName}`,
+      required: false,
+      requiredReason: null,
+    }));
+
+  const coreRoot = await resolveFirstExistingDirectory(
+    coreSkillRootCandidates(config, moduleDir, options.companyId),
+  );
+  const workspaceRoot = await resolveFirstExistingDirectory(workspaceSkillRootCandidates(config));
+
+  const discoveredCoreEntries = coreRoot
+    ? await listFlatSkillEntries({
+        root: coreRoot,
+        keyPrefix: "paperclipai/paperclip",
+        required: true,
+        requiredReason: "Bundled Paperclip skills are always available for local adapters.",
+      })
+    : [];
+
+  const discoveredWorkspaceEntries = workspaceRoot
+    ? await listFlatSkillEntries({
+        root: workspaceRoot,
+        keyPrefix: "paperclipai/workspace",
+        required: false,
+      })
+    : [];
+
+  const allEntries = dedupeSkillEntries([
+    ...discoveredCoreEntries,
+    ...configuredCoreEntries,
+    ...discoveredWorkspaceEntries,
+    ...configuredWorkspaceEntries,
+  ]);
+
+  const syncRaw = config.paperclipSkillSync;
+  if (typeof syncRaw === "object" && syncRaw !== null) {
+    const desired = Array.isArray((syncRaw as any).desiredSkills) ? (syncRaw as any).desiredSkills : [];
+    for (const entry of allEntries) {
+      if (entry.key.startsWith("paperclipai/workspace/")) {
+        const matchingDesired = desired.find((d: string) => d.endsWith("/" + entry.runtimeName));
+        if (matchingDesired) {
+          entry.key = matchingDesired;
+        }
+      }
+    }
+  }
+
+  return allEntries;
+}
+
 async function resolvePaperclipHermesSkillName(runtimeName: string, source: string): Promise<string> {
   try {
     const content = await fs.readFile(path.join(source, "SKILL.md"), "utf8");
@@ -136,12 +355,16 @@ async function resolvePaperclipHermesSkillName(runtimeName: string, source: stri
 // Public API
 // ---------------------------------------------------------------------------
 
-async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
+async function buildHermesSkillSnapshot(
+  config: Record<string, unknown>,
+  companyId?: string | null,
+): Promise<AdapterSkillSnapshot> {
   const home = resolveHermesHome(config);
   const hermesSkillsHome = path.join(home, ".hermes", "skills");
 
-  // 1. Scan Paperclip-managed skills (bundled with the adapter)
-  const paperclipEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  // 1. Scan Paperclip-managed skills: core Paperclip skills plus optional
+  // workspace skills from the user's Paperclip workspace.
+  const paperclipEntries = await readHermesPaperclipSkillEntries(config, __moduleDir, { companyId });
   const desiredSkills = resolvePaperclipDesiredSkillNames(config, paperclipEntries);
   const desiredSet = new Set(desiredSkills);
   const availableByKey = new Map(paperclipEntries.map((e) => [e.key, e]));
@@ -219,7 +442,7 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
 export async function listHermesSkills(
   ctx: AdapterSkillContext,
 ): Promise<AdapterSkillSnapshot> {
-  return buildHermesSkillSnapshot(ctx.config);
+  return buildHermesSkillSnapshot(ctx.config, ctx.companyId);
 }
 
 export async function syncHermesSkills(
@@ -228,7 +451,7 @@ export async function syncHermesSkills(
 ): Promise<AdapterSkillSnapshot> {
   // Hermes manages its own skill loading — sync is a no-op.
   // Return the current snapshot so the UI stays in sync.
-  return buildHermesSkillSnapshot(ctx.config);
+  return buildHermesSkillSnapshot(ctx.config, ctx.companyId);
 }
 
 export function resolveHermesDesiredSkillNames(

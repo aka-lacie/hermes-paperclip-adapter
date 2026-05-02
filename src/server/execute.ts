@@ -31,7 +31,6 @@ import {
   ensureAbsoluteDirectory,
   appendWithCap,
   runningProcesses,
-  readPaperclipRuntimeSkillEntries,
   resolvePaperclipDesiredSkillNames,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -59,6 +58,10 @@ import {
   ensureProfile,
   resolveProfilePath,
 } from "./profiles.js";
+
+import {
+  readHermesPaperclipSkillEntries,
+} from "./skills.js";
 
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
@@ -146,6 +149,57 @@ async function hashPathContents(
     return;
   }
   hash.update(`other:${relativePath}:${stat.mode}\n`);
+}
+
+function materializedFileMode(sourceMode: number): number {
+  return (sourceMode & 0o111) !== 0 ? 0o755 : 0o644;
+}
+
+async function copySkillTreeContents(
+  source: string,
+  destination: string,
+  seenDirectories = new Set<string>(),
+  rootSource?: string,
+): Promise<void> {
+  const stat = await fs.lstat(source);
+  const actualRoot = rootSource ?? await fs.realpath(source).catch(() => source);
+
+  if (stat.isSymbolicLink()) {
+    const realPath = await fs.realpath(source);
+    if (!rootSource || realPath === actualRoot || realPath.startsWith(actualRoot + nodePath.sep)) {
+      await copySkillTreeContents(realPath, destination, seenDirectories, actualRoot);
+    }
+    return;
+  }
+
+  if (stat.isDirectory()) {
+    const realDir = await fs.realpath(source).catch(() => source);
+    if (seenDirectories.has(realDir)) return;
+    seenDirectories.add(realDir);
+
+    await fs.mkdir(destination, { recursive: true, mode: 0o755 });
+
+    const entries = await fs.readdir(source, { withFileTypes: true });
+    for (const entry of entries) {
+      await copySkillTreeContents(
+        nodePath.join(source, entry.name),
+        nodePath.join(destination, entry.name),
+        seenDirectories,
+        actualRoot,
+      );
+    }
+    return;
+  }
+
+  if (stat.isFile()) {
+    await fs.mkdir(nodePath.dirname(destination), { recursive: true, mode: 0o755 });
+    await fs.writeFile(destination, await fs.readFile(source), {
+      mode: materializedFileMode(stat.mode),
+    });
+    return;
+  }
+
+  throw new Error(`Unsupported file type in skill bundle: ${source}`);
 }
 
 function resolvePaperclipHome(): string {
@@ -268,11 +322,8 @@ async function prepareHermesPaperclipSkillBundle(
     await fs.rm(tempRoot, { recursive: true, force: true });
     await fs.mkdir(tempRoot, { recursive: true });
     for (const { entry, skillName } of uniquePrepared) {
-      await fs.cp(entry.source, nodePath.join(tempRoot, skillName), {
-        recursive: true,
-        dereference: true,
-        force: true,
-      });
+      const destPath = nodePath.join(tempRoot, skillName);
+      await copySkillTreeContents(entry.source, destPath);
     }
     await fs.writeFile(
       nodePath.join(tempRoot, ".paperclip-hermes-skill-bundle.json"),
@@ -1139,8 +1190,11 @@ export async function execute(
     }
   }
 
-  const paperclipSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredSkillNames = resolvePaperclipDesiredSkillNames(config, paperclipSkillEntries);
+  const skillDiscoveryConfig = { ...ctx.config, ...config };
+  const paperclipSkillEntries = await readHermesPaperclipSkillEntries(skillDiscoveryConfig, __moduleDir, {
+    companyId: ctx.agent?.companyId,
+  });
+  const desiredSkillNames = resolvePaperclipDesiredSkillNames(skillDiscoveryConfig, paperclipSkillEntries);
   await prepareHermesPaperclipSkillBundle(ctx.onLog, {
     companyId: ctx.agent?.companyId ?? "unknown-company",
     agentId: ctx.agent?.id ?? "unknown-agent",

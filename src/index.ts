@@ -93,6 +93,7 @@ Leave blank to use the default profile.
 | extraArgs | string[] | [] | Additional CLI arguments |
 | env | object | {} | Extra environment variables |
 | promptTemplate | string | (default) | Custom prompt template with {{variable}} placeholders |
+| instructionsFilePath | string | (none) | Absolute path or path relative to workspace cwd; relative paths also fall back to the managed agent runtime directory |
 
 ## Available Template Variables
 

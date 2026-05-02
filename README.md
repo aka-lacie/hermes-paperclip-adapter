@@ -183,7 +183,7 @@ npm install @henkey/hermes-paperclip-adapter
 | `extraArgs` | string[] | `[]` | Additional CLI arguments |
 | `env` | object | `{}` | Extra environment variables |
 | `promptTemplate` | string | *(built-in)* | Custom prompt template (not recommended — let Paperclip generate managed bundles instead) |
-| `instructionsFilePath` | string | *(none)* | Path to AGENTS.md relative to workspace cwd |
+| `instructionsFilePath` | string | *(none)* | Absolute path or path relative to workspace cwd; relative paths also fall back to the managed agent runtime directory |
 | `paperclipApiUrl` | string | `http://127.0.0.1:3100/api` | Paperclip API base URL |
 
 ## Architecture

@@ -66,7 +66,12 @@ export async function detectModel(
 
 /**
  * Parse model.default, model.provider, model.base_url, and model.api_mode
- * from raw YAML content. Uses simple regex parsing to avoid a YAML dependency.
+ * from raw YAML content. Also accepts Hermes' flat config shape:
+ *
+ *   model: "anthropic/claude-sonnet-4.6"
+ *   provider: "openrouter"
+ *
+ * Uses simple regex parsing to avoid a YAML dependency.
  */
 export function parseModelFromConfig(content: string): DetectedModel | null {
   const lines = content.split("\n");
@@ -81,32 +86,38 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
     const trimmed = line.trimEnd();
     const indent = line.length - line.trimStart().length;
 
-    // Track top-level keys
-    if (indent === 0) {
-      const topMatch = trimmed.match(/^([\w_]+)\s*:\s*(.+)$/);
-      if (topMatch) {
-        const key = topMatch[1];
-        const val = topMatch[2].trim().replace(/#.*$/, "").trim().replace(/^['"]|['"]$/g, "");
-        continue;
-      }
+    // Exit model section if we hit an unindented line that's not a comment
+    if (inModelSection && indent <= modelSectionIndent && trimmed && !trimmed.startsWith("#")) {
+      inModelSection = false;
     }
 
-    // Track model: section
-    if (/^model:\s*$/.test(trimmed) && indent === 0) {
+    // Track model: section. This must run before scalar key parsing so
+    // "model:" opens a section while "model: value" remains a flat key.
+    if (/^model:\s*(?:#.*)?$/.test(trimmed) && indent === 0) {
       inModelSection = true;
       modelSectionIndent = 0;
       continue;
     }
 
-    if (inModelSection && indent <= modelSectionIndent && trimmed && !trimmed.startsWith("#")) {
-      inModelSection = false;
+    // Track top-level scalar keys used by Hermes' flat config shape.
+    if (indent === 0) {
+      const topMatch = trimmed.match(/^([\w_]+)\s*:\s*(.*)$/);
+      if (topMatch) {
+        const key = topMatch[1];
+        const val = parseYamlScalar(topMatch[2]);
+        if (key === "model") model = val;
+        if (key === "provider") provider = val;
+        if (key === "base_url") baseUrl = val;
+        if (key === "api_mode") apiMode = val;
+        continue;
+      }
     }
 
     if (inModelSection) {
       const match = trimmed.match(/^\s*(\w+)\s*:\s*(.+)$/);
       if (match) {
         const key = match[1];
-        const val = match[2].trim().replace(/#.*$/, "").trim().replace(/^['"]|['"]$/g, "");
+        const val = parseYamlScalar(match[2]);
         if (key === "default") model = val;
         if (key === "provider") provider = val;
         if (key === "base_url") baseUrl = val;
@@ -117,6 +128,37 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
 
   if (!model) return null;
   return { model, provider, baseUrl, apiMode, source: "config" };
+}
+
+function parseYamlScalar(raw: string): string {
+  let inQuote = false;
+  let quoteChar = '';
+  let endIdx = raw.length;
+  let isEscaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+    if (c === '\\') {
+      isEscaped = true;
+      continue;
+    }
+    if (inQuote) {
+      if (c === quoteChar) inQuote = false;
+    } else {
+      if (c === '"' || c === "'") {
+        inQuote = true;
+        quoteChar = c;
+      } else if (c === '#' && (i === 0 || raw[i-1] === ' ' || raw[i-1] === '\t')) {
+        endIdx = i;
+        break;
+      }
+    }
+  }
+  const withoutComment = raw.slice(0, endIdx).trim();
+  return withoutComment.replace(/^['"]|['"]$/g, "");
 }
 
 /**
