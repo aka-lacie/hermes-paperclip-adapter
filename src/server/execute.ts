@@ -63,6 +63,10 @@ import {
   readHermesPaperclipSkillEntries,
 } from "./skills.js";
 
+import {
+  bootstrapManagedRuntimePath,
+} from "./managed-runtime-path.js";
+
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as nodePath from "node:path";
@@ -1329,6 +1333,23 @@ export async function execute(
   const userEnvFinal = userEnv;
   if (userEnvFinal && typeof userEnvFinal === "object") {
     Object.assign(env, userEnvFinal);
+  }
+
+  const runtimePath = await bootstrapManagedRuntimePath(env, {
+    extraDirs: nodePath.isAbsolute(hermesCmd) ? [nodePath.dirname(hermesCmd)] : [],
+    extraSearchRoots: [__moduleDir],
+    executables: ["codex"],
+  });
+  if (runtimePath.executables.codex) {
+    await ctx.onLog(
+      "stdout",
+      `[paperclip] Codex CLI available for Hermes managed runtime: ${runtimePath.executables.codex}\n`,
+    );
+  } else {
+    await ctx.onLog(
+      "stdout",
+      "[paperclip] Warning: Codex CLI was not found on the managed runtime PATH. GPT-5.x/Codex-backed Hermes runs may fail with ENOENT for \"codex\".\n",
+    );
   }
 
   // ── Resolve working directory ──────────────────────────────────────────

@@ -12,12 +12,16 @@ import type {
 } from "@paperclipai/adapter-utils";
 
 import { execFile } from "node:child_process";
+import * as nodePath from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+import { bootstrapManagedRuntimePath } from "./managed-runtime-path.js";
 
 const execFileAsync = promisify(execFile);
+const __moduleDir = nodePath.dirname(fileURLToPath(import.meta.url));
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
@@ -109,6 +113,37 @@ async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
       code: "hermes_python_missing",
     };
   }
+}
+
+async function checkCodexCli(
+  config: Record<string, unknown>,
+): Promise<AdapterEnvironmentCheck | null> {
+  const envConfig = (config.env ?? {}) as Record<string, unknown>;
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
+
+  const pathResult = await bootstrapManagedRuntimePath(env, {
+    extraSearchRoots: [__moduleDir],
+    executables: ["codex"],
+  });
+  const codexPath = pathResult.executables.codex;
+
+  if (codexPath) {
+    return {
+      level: "info",
+      message: `Codex CLI available to managed runtime: ${codexPath}`,
+      code: "codex_cli_found",
+    };
+  }
+
+  return {
+    level: "warn",
+    message: "Codex CLI not found on the managed runtime PATH",
+    hint: "Install Codex or add its bin directory to the agent env PATH. GPT-5.x/Codex-backed Hermes runs need a resolvable `codex` executable.",
+    code: "codex_cli_not_found",
+  };
 }
 
 function checkModel(
@@ -307,15 +342,19 @@ export async function testEnvironment(
   const pythonCheck = await checkPython();
   if (pythonCheck) checks.push(pythonCheck);
 
-  // 4. Model config
+  // 4. Codex runtime available?
+  const codexCheck = await checkCodexCli(config);
+  if (codexCheck) checks.push(codexCheck);
+
+  // 5. Model config
   const modelCheck = checkModel(config);
   if (modelCheck) checks.push(modelCheck);
 
-  // 5. API keys (check config.env — server resolves secrets before calling us)
+  // 6. API keys (check config.env — server resolves secrets before calling us)
   const apiKeyCheck = checkApiKeys(config);
   if (apiKeyCheck) checks.push(apiKeyCheck);
 
-  // 6. Provider/model consistency
+  // 7. Provider/model consistency
   const providerCheck = await checkProviderConsistency(config);
   if (providerCheck) checks.push(providerCheck);
 
