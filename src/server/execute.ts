@@ -71,7 +71,7 @@ import {
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as nodePath from "node:path";
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, execSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1022,6 +1022,47 @@ function readSessionUsageFromDb(
   }
 }
 
+type SessionDbStatus = "present" | "missing" | "unknown";
+
+function getHermesSessionDbStatus(
+  sessionId: string,
+  hermesHomeOverride?: string,
+): SessionDbStatus {
+  if (!isValidHermesSessionId(sessionId)) return "missing";
+
+  const hermesHome = hermesHomeOverride
+    || process.env.HERMES_HOME
+    || nodePath.join(homedir(), ".hermes");
+  const dbPath = nodePath.join(hermesHome, "state.db");
+
+  try {
+    fsSync.accessSync(dbPath, fsSync.constants.R_OK);
+  } catch {
+    return "missing";
+  }
+
+  try {
+    const script = [
+      "import pathlib, sqlite3, sys",
+      "db_path, session_id = sys.argv[1], sys.argv[2]",
+      "conn = sqlite3.connect(pathlib.Path(db_path).as_uri() + '?mode=ro', uri=True)",
+      "row = conn.execute('SELECT 1 FROM sessions WHERE id = ? LIMIT 1', (session_id,)).fetchone()",
+      "conn.close()",
+      "print('present' if row else 'missing')",
+    ].join("\n");
+
+    const result = execFileSync("python3", ["-c", script, dbPath, sessionId], {
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+
+    return result === "present" ? "present" : "missing";
+  } catch {
+    return "unknown";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Output parsing
 // ---------------------------------------------------------------------------
@@ -1599,6 +1640,17 @@ export async function execute(
   }
 
   if (shouldResume && prevSessionId) {
+    const sessionStatus = getHermesSessionDbStatus(prevSessionId, effectiveHermesHome);
+    if (sessionStatus === "missing") {
+      shouldResume = false;
+      resumeReason = `previous session ${prevSessionId} is not present in ${nodePath.join(effectiveHermesHome, "state.db")} — starting fresh`;
+    } else if (sessionStatus === "unknown") {
+      shouldResume = false;
+      resumeReason = `could not verify previous session ${prevSessionId} in ${nodePath.join(effectiveHermesHome, "state.db")} — starting fresh`;
+    }
+  }
+
+  if (shouldResume && prevSessionId) {
     args.push("--resume", prevSessionId);
   }
 
@@ -1679,7 +1731,7 @@ export async function execute(
   if (toolsets) commandNotes.push(`Toolsets: ${toolsets}`);
   commandNotes.push(`Memory: ${memoryScope}${deliveryTarget !== "none" ? ` → ${deliveryTarget}` : ""}`);
   if (instructionsFilePath) commandNotes.push(`Instructions: ${instructionsFilePath}`);
-  if (prevSessionId) commandNotes.push(`Resuming session: ${prevSessionId}`);
+  if (shouldResume && prevSessionId) commandNotes.push(`Resuming session: ${prevSessionId}`);
 
   if (ctx.onMeta) {
     await ctx.onMeta({
