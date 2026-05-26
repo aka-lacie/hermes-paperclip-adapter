@@ -6,7 +6,8 @@
  *
  * Verified CLI flags (hermes chat):
  *   -q/--query         single query (non-interactive)
- *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
+ *   -Q/--quiet         quiet mode (no banner/spinner/tool previews, only response + session_id)
+ *   --quiet-progress   quiet mode with compact tool progress for adapters
  *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
  *   -t/--toolsets      comma-separated toolsets to enable
  *   --provider         inference provider (auto, openrouter, nous, etc.)
@@ -76,6 +77,9 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __moduleDir = nodePath.dirname(fileURLToPath(import.meta.url));
+const PAPERCLIP_TRANSCRIPT_PLUGIN_NAME = "paperclip-adapter-events";
+const PAPERCLIP_TRANSCRIPT_EVENT_PREFIX = "__PAPERCLIP_TRANSCRIPT__";
+const PAPERCLIP_TRANSCRIPT_PLUGIN_ASSET_DIR = "paperclip-transcript-plugin";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -218,16 +222,173 @@ function yamlQuote(value: string): string {
   return JSON.stringify(value);
 }
 
+function parseYamlString(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("\"")) {
+    const match = trimmed.match(/^"((?:\\.|[^"\\])*)"/);
+    if (!match) return null;
+    try {
+      const parsed = JSON.parse(`"${match[1]}"`);
+      return typeof parsed === "string" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (trimmed.startsWith("'")) {
+    const match = trimmed.match(/^'((?:[^']|'')*)'/);
+    return match ? match[1].replaceAll("''", "'") : null;
+  }
+  return trimmed.replace(/\s+#.*$/u, "").trim() || null;
+}
+
+function parseYamlStringArray(value: string): string[] | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseExternalDirs(lines: string[], externalStart: number, externalEnd: number): string[] {
+  const firstLine = lines[externalStart];
+  const inlineMatch = firstLine.match(/^\s{2}external_dirs:\s*(\[.*\])\s*$/);
+  if (inlineMatch) {
+    return parseYamlStringArray(inlineMatch[1]) ?? [];
+  }
+
+  const out: string[] = [];
+  for (let index = externalStart + 1; index < externalEnd; index += 1) {
+    const match = lines[index].match(/^\s{2,}-\s+(.*)$/);
+    if (!match) continue;
+    const value = parseYamlString(match[1]);
+    if (value) out.push(value);
+  }
+  return out;
+}
+
+function isPaperclipManagedBundleDir(dir: string): boolean {
+  return dir.replaceAll("\\", "/").includes("/hermes-skill-bundles/");
+}
+
+function mergeHermesExternalDirs(existingDirs: string[], paperclipDirs: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const dir of [
+    ...existingDirs.filter((existing) => !isPaperclipManagedBundleDir(existing)),
+    ...paperclipDirs,
+  ]) {
+    const dedupeKey = nodePath.resolve(dir);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(dir);
+  }
+
+  return out;
+}
+
+function parseYamlListBlock(lines: string[], listStart: number, listEnd: number): string[] {
+  const firstLine = lines[listStart];
+  const inlineMatch = firstLine.match(/^\s{2}enabled:\s*(\[.*\])\s*$/);
+  if (inlineMatch) {
+    return parseYamlStringArray(inlineMatch[1]) ?? [];
+  }
+
+  const out: string[] = [];
+  for (let index = listStart + 1; index < listEnd; index += 1) {
+    const match = lines[index].match(/^\s{2,}-\s+(.*)$/);
+    if (!match) continue;
+    const value = parseYamlString(match[1]);
+    if (value) out.push(value);
+  }
+  return out;
+}
+
+function mergeStringList(existing: string[], additions: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [...existing, ...additions]) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function upsertHermesEnabledPlugin(configContent: string, pluginName: string): string {
+  const lines = configContent.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  const pluginLinesFor = (enabledPlugins: string[]) => [
+    "  enabled:",
+    ...enabledPlugins.map((name) => `  - ${yamlQuote(name)}`),
+  ];
+
+  const pluginsIndex = lines.findIndex((line) => /^plugins:\s*$/.test(line));
+  if (pluginsIndex < 0) {
+    return [
+      ...lines,
+      "plugins:",
+      ...pluginLinesFor([pluginName]),
+      "",
+    ].join("\n");
+  }
+
+  let pluginsEnd = lines.length;
+  for (let index = pluginsIndex + 1; index < lines.length; index += 1) {
+    if (/^\S/.test(lines[index]) && !/^\s*$/.test(lines[index])) {
+      pluginsEnd = index;
+      break;
+    }
+  }
+
+  let enabledStart = -1;
+  let enabledEnd = pluginsEnd;
+  for (let index = pluginsIndex + 1; index < pluginsEnd; index += 1) {
+    if (/^\s{2}enabled:\s*/.test(lines[index])) {
+      enabledStart = index;
+      enabledEnd = index + 1;
+      while (
+        enabledEnd < pluginsEnd &&
+        (/^\s{2,}-\s+/.test(lines[enabledEnd]) || /^\s*$/.test(lines[enabledEnd]))
+      ) {
+        enabledEnd += 1;
+      }
+      break;
+    }
+  }
+
+  const enabledPlugins = mergeStringList(
+    enabledStart >= 0 ? parseYamlListBlock(lines, enabledStart, enabledEnd) : [],
+    [pluginName],
+  );
+  const enabledLines = pluginLinesFor(enabledPlugins);
+
+  if (enabledStart >= 0) {
+    lines.splice(enabledStart, enabledEnd - enabledStart, ...enabledLines);
+  } else {
+    lines.splice(pluginsIndex + 1, 0, ...enabledLines);
+  }
+
+  return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
+}
+
 function upsertHermesExternalDirs(configContent: string, externalDirs: string[]): string {
   const lines = configContent.replace(/\r\n/g, "\n").split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   const skillsIndex = lines.findIndex((line) => /^skills:\s*$/.test(line));
-  const externalLines = [
-    "  external_dirs:",
-    ...externalDirs.map((dir) => `  - ${yamlQuote(dir)}`),
-  ];
 
   if (skillsIndex < 0) {
+    const externalLines = [
+      "  external_dirs:",
+      ...externalDirs.map((dir) => `  - ${yamlQuote(dir)}`),
+    ];
     return [...lines, "skills:", ...externalLines, ""].join("\n");
   }
 
@@ -252,12 +413,42 @@ function upsertHermesExternalDirs(configContent: string, externalDirs: string[])
     }
   }
 
+  const mergedExternalDirs = mergeHermesExternalDirs(
+    externalStart >= 0 ? parseExternalDirs(lines, externalStart, externalEnd) : [],
+    externalDirs,
+  );
+  const externalLines = [
+    "  external_dirs:",
+    ...mergedExternalDirs.map((dir) => `  - ${yamlQuote(dir)}`),
+  ];
+
   if (externalStart >= 0) {
     lines.splice(externalStart, externalEnd - externalStart, ...externalLines);
   } else {
     lines.splice(skillsIndex + 1, 0, ...externalLines);
   }
   return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
+}
+
+async function resolveSharedSkillSupportEntries(
+  entries: PaperclipSkillEntry[],
+): Promise<Array<{ source: string; relativePath: string }>> {
+  const out: Array<{ source: string; relativePath: string }> = [];
+  const seen = new Set<string>();
+
+  for (const entry of entries) {
+    if (!entry.key.startsWith("paperclipai/workspace/")) continue;
+    const skillRoot = nodePath.dirname(entry.source);
+    const supportPath = nodePath.join(skillRoot, ".common");
+    const hasSupport = await fs.stat(supportPath).then((stats) => stats.isDirectory()).catch(() => false);
+    if (!hasSupport) continue;
+    const realPath = await fs.realpath(supportPath).catch(() => supportPath);
+    if (seen.has(realPath)) continue;
+    seen.add(realPath);
+    out.push({ source: supportPath, relativePath: ".common" });
+  }
+
+  return out.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
 async function writeFileIfChanged(filePath: string, content: string): Promise<boolean> {
@@ -268,6 +459,73 @@ async function writeFileIfChanged(filePath: string, content: string): Promise<bo
   await fs.writeFile(tempPath, content, "utf8");
   await fs.rename(tempPath, filePath);
   return true;
+}
+
+async function cleanupOldHermesPaperclipSkillBundles(
+  bundleRoot: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  const bundleParent = nodePath.dirname(bundleRoot);
+  const currentBundleName = nodePath.basename(bundleRoot);
+  const entries = await fs.readdir(bundleParent, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+
+  for (const entry of entries) {
+    if (entry.name === currentBundleName) continue;
+    const entryPath = nodePath.join(bundleParent, entry.name);
+    await fs.rm(entryPath, { recursive: true, force: true });
+    removed += 1;
+  }
+
+  if (removed > 0) {
+    await onLog(
+      "stdout",
+      `[paperclip] Removed ${removed} old Hermes Paperclip skill bundle${removed === 1 ? "" : "s"} from ${bundleParent}\n`,
+    );
+  }
+}
+
+async function readPaperclipTranscriptPluginAsset(fileName: string): Promise<string> {
+  const candidates = [
+    nodePath.join(__moduleDir, PAPERCLIP_TRANSCRIPT_PLUGIN_ASSET_DIR, fileName),
+    nodePath.join(__moduleDir, "..", "..", "src", "server", PAPERCLIP_TRANSCRIPT_PLUGIN_ASSET_DIR, fileName),
+  ];
+
+  for (const candidate of candidates) {
+    const content = await fs.readFile(candidate, "utf8").catch(() => null);
+    if (content !== null) return content;
+  }
+
+  throw new Error(
+    `Missing Hermes Paperclip transcript plugin asset "${fileName}". Run npm run build before loading the adapter.`,
+  );
+}
+
+async function ensurePaperclipTranscriptPlugin(
+  hermesHome: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  const pluginRoot = nodePath.join(hermesHome, "plugins", PAPERCLIP_TRANSCRIPT_PLUGIN_NAME);
+  const manifestPath = nodePath.join(pluginRoot, "plugin.yaml");
+  const initPath = nodePath.join(pluginRoot, "__init__.py");
+  const manifest = await readPaperclipTranscriptPluginAsset("plugin.yaml");
+  const init = await readPaperclipTranscriptPluginAsset("__init__.py");
+
+  await fs.mkdir(pluginRoot, { recursive: true });
+  const changedManifest = await writeFileIfChanged(manifestPath, manifest);
+  const changedInit = await writeFileIfChanged(initPath, init);
+
+  const configPath = nodePath.join(hermesHome, "config.yaml");
+  const currentConfig = await fs.readFile(configPath, "utf8").catch(() => "");
+  const updatedConfig = upsertHermesEnabledPlugin(currentConfig, PAPERCLIP_TRANSCRIPT_PLUGIN_NAME);
+  const changedConfig = await writeFileIfChanged(configPath, updatedConfig);
+
+  if (changedManifest || changedInit || changedConfig) {
+    await onLog(
+      "stdout",
+      `[paperclip] Prepared Hermes structured transcript plugin: ${pluginRoot}\n`,
+    );
+  }
 }
 
 async function prepareHermesPaperclipSkillBundle(
@@ -298,13 +556,20 @@ async function prepareHermesPaperclipSkillBundle(
     seenSkillNames.add(skillName);
     return true;
   });
+  const sharedSupportEntries = await resolveSharedSkillSupportEntries(
+    uniquePrepared.map(({ entry }) => entry),
+  );
 
   const hash = createHash("sha256");
-  hash.update("paperclip-hermes-skill-bundle:v1\n");
+  hash.update("paperclip-hermes-skill-bundle:v2\n");
   uniquePrepared.sort((left, right) => left.entry.key.localeCompare(right.entry.key));
   for (const { entry, skillName } of uniquePrepared) {
     hash.update(`skill:${entry.key}:${entry.runtimeName}:${skillName}\n`);
     await hashPathContents(entry.source, hash, skillName, new Set());
+  }
+  for (const supportEntry of sharedSupportEntries) {
+    hash.update(`support:${supportEntry.relativePath}\n`);
+    await hashPathContents(supportEntry.source, hash, supportEntry.relativePath, new Set());
   }
 
   const bundleHash = hash.digest("hex");
@@ -329,16 +594,26 @@ async function prepareHermesPaperclipSkillBundle(
       const destPath = nodePath.join(tempRoot, skillName);
       await copySkillTreeContents(entry.source, destPath);
     }
+    for (const supportEntry of sharedSupportEntries) {
+      await copySkillTreeContents(
+        supportEntry.source,
+        nodePath.join(tempRoot, supportEntry.relativePath),
+      );
+    }
     await fs.writeFile(
       nodePath.join(tempRoot, ".paperclip-hermes-skill-bundle.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         companyId: options.companyId,
         agentId: options.agentId,
         skills: uniquePrepared.map(({ entry, skillName }) => ({
           key: entry.key,
           runtimeName: entry.runtimeName,
           name: skillName,
+          source: entry.source,
+        })),
+        support: sharedSupportEntries.map((entry) => ({
+          path: entry.relativePath,
           source: entry.source,
         })),
       }, null, 2),
@@ -348,6 +623,7 @@ async function prepareHermesPaperclipSkillBundle(
     await fs.rename(tempRoot, bundleRoot);
     await onLog("stdout", `[paperclip] Prepared Hermes Paperclip skill bundle with ${uniquePrepared.length} skills at ${bundleRoot}\n`);
   }
+  await cleanupOldHermesPaperclipSkillBundles(bundleRoot, onLog);
 
   const configPath = nodePath.join(options.hermesHome, "config.yaml");
   const currentConfig = await fs.readFile(configPath, "utf8").catch(() => "");
@@ -568,6 +844,7 @@ function cleanResponse(raw: string): string {
     const t = line.trim();
     if (!t) return true; // keep blank lines for paragraph separation
     if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+    if (t.startsWith(PAPERCLIP_TRANSCRIPT_EVENT_PREFIX)) return false;
     // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content) ──
     if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t) || /^│/.test(t)) return false;
     if (t.startsWith("session_id:")) return false;
@@ -648,7 +925,7 @@ function extractFinalResponseBlock(stdout: string): string {
   let lastToolIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     const t = lines[i].trim();
-    if (/^┊\s*\p{Emoji}/u.test(t) || /^\[done\]\s*┊/.test(t)) {
+    if (/^┊\s*\p{Emoji}/u.test(t) || /^\[done\]\s*┊/.test(t) || t.startsWith(PAPERCLIP_TRANSCRIPT_EVENT_PREFIX)) {
       lastToolIdx = i;
       break;
     }
@@ -899,7 +1176,7 @@ function runChildProcessWithIdleTimeout(
       return false;
     };
 
-    const scheduleIdleTimer = (timeoutSec: number, reason: "initial" | "regular" | "command") => {
+    const scheduleIdleTimer = (timeoutSec: number, reason: "initial" | "regular" | "command" | "operation") => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleKilled = true;
@@ -909,6 +1186,8 @@ function runChildProcessWithIdleTimeout(
             ? `\n[hermes] INITIAL IDLE TIMEOUT: No meaningful output for ${timeoutSec}s while waiting for the first model response. Terminating subprocess.\n`
             : reason === "command"
               ? `\n[hermes] IDLE TIMEOUT: No output for ${timeoutSec}s while command was running. Terminating subprocess.\n`
+              : reason === "operation"
+                ? `\n[hermes] IDLE TIMEOUT: No output for ${timeoutSec}s while a long operation was running. Terminating subprocess.\n`
               : `\n[hermes] IDLE TIMEOUT: No output for ${timeoutSec}s. Terminating subprocess.\n`;
         opts.onLog("stdout", message)
           .catch(() => {});
@@ -943,7 +1222,7 @@ function runChildProcessWithIdleTimeout(
     // like "1.2s") or a new tool starting, switch back to the short one.
     //
     // - idleTimeoutSec (short): no command in flight = agent may be stuck
-    // - commandIdleTimeoutSec (extended): command running = agent is waiting
+    // - commandIdleTimeoutSec (extended): command/long operation running = agent is waiting
     //
     // We detect command lifecycle from the ┊ prefixed lines Hermes emits:
     //   ┊ 💻 preparing terminal…      → command starting (in flight)
@@ -964,13 +1243,32 @@ function runChildProcessWithIdleTimeout(
 
     // Pattern that indicates a tool call completed (line ends with timing)
     const TOOL_DONE_PATTERN = /┊\s+.+\s+\d+(\.\d+)?s\s*$/m;
+    const LONG_OPERATION_START_PATTERN = /(?:⟳|↻|🗜️?)\s*(?:compacting|compressing)\s+context/i;
+    let longOperationInFlight = false;
 
     const updateIdleTimerForChunk = (text: string) => {
       // Check each line for tool lifecycle markers
       const lines = text.split(/\r?\n/);
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("┊")) continue;
+        if (!trimmed) continue;
+
+        if (LONG_OPERATION_START_PATTERN.test(trimmed)) {
+          if (!longOperationInFlight) {
+            longOperationInFlight = true;
+            sawMeaningfulOutput = true;
+            scheduleIdleTimer(commandIdleTimeoutSec, "operation");
+          }
+          continue;
+        }
+
+        // Any later output means the long silent operation made it through.
+        // Normal idle handling for this chunk has already reset the timer.
+        if (longOperationInFlight) {
+          longOperationInFlight = false;
+        }
+
+        if (!trimmed.startsWith("┊")) continue;
 
         if (TOOL_DONE_PATTERN.test(trimmed)) {
           // Tool completed — back to short idle timeout
@@ -1160,10 +1458,14 @@ export async function execute(
     : buildPrompt(ctx, config);
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
+  // Use quiet-progress by default: clean Paperclip run logs while preserving
+  // Hermes tool/activity output for liveness. Full quiet remains available via
+  // adapterConfig.quiet=true for final-response-only automation.
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
+  const useQuietProgress = cfgBoolean(config.quietProgress) !== false; // default true
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
+  else if (useQuietProgress) args.push("--quiet-progress");
 
   // ── Build environment (before args, needed for profile HERMES_HOME) ───
   const env: Record<string, string> = {
@@ -1206,6 +1508,7 @@ export async function execute(
     skillsEntries: paperclipSkillEntries,
     desiredSkillNames,
   });
+  await ensurePaperclipTranscriptPlugin(effectiveHermesHome, ctx.onLog);
 
   // When a profile is set and no explicit model/provider is in adapterConfig,
   // let Hermes use its own config.yaml (which we already detected from).
@@ -1350,6 +1653,13 @@ export async function execute(
       "stdout",
       "[paperclip] Warning: Codex CLI was not found on the managed runtime PATH. GPT-5.x/Codex-backed Hermes runs may fail with ENOENT for \"codex\".\n",
     );
+  }
+
+  // The managed plugin is inert unless this flag is present. During Paperclip
+  // runs it emits structured tool_call/tool_result JSON lines for the UI parser.
+  env.PAPERCLIP_HERMES_STRUCTURED_EVENTS = "1";
+  if (!env.PAPERCLIP_HERMES_TOOL_RESULT_MAX_CHARS) {
+    env.PAPERCLIP_HERMES_TOOL_RESULT_MAX_CHARS = "24000";
   }
 
   // ── Resolve working directory ──────────────────────────────────────────

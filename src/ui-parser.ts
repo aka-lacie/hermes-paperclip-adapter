@@ -16,6 +16,7 @@
 // ── Inlined constants (no imports) ─────────────────────────────────────────
 
 const TOOL_OUTPUT_PREFIX = "\u250A"; // ┊
+const PAPERCLIP_TRANSCRIPT_EVENT_PREFIX = "__PAPERCLIP_TRANSCRIPT__ ";
 
 // ── Kaomoji / noise stripping ──────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ function parseToolCompletionLine(line: string): ToolCompletion | null {
 
   cleaned = cleaned.slice(TOOL_OUTPUT_PREFIX.length);
   cleaned = stripKaomoji(cleaned).trim();
+  cleaned = cleaned.replace(/^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic})\s+/u, "").trim();
 
   const durationMatch = cleaned.match(/([\d.]+s)\s*(?:\([\d.]+s\))?\s*$/);
   const duration = durationMatch ? durationMatch[1] : "";
@@ -67,52 +69,52 @@ function parseToolCompletionLine(line: string): ToolCompletion | null {
   const detail = parts[2].trim();
 
   const nameMap: Record<string, string> = {
-    $: "shell",
-    exec: "shell",
-    terminal: "shell",
-    search: "search",
-    fetch: "fetch",
-    crawl: "crawl",
-    navigate: "browser",
-    snapshot: "browser",
-    click: "browser",
-    type: "browser",
-    scroll: "browser",
-    back: "browser",
-    press: "browser",
-    close: "browser",
-    images: "browser",
-    vision: "browser",
-    read: "read",
-    write: "write",
+    $: "terminal",
+    exec: "terminal",
+    terminal: "terminal",
+    search: "web_search",
+    fetch: "web_extract",
+    crawl: "web_crawl",
+    navigate: "browser_navigate",
+    snapshot: "browser_snapshot",
+    click: "browser_click",
+    type: "browser_type",
+    scroll: "browser_scroll",
+    back: "browser_back",
+    press: "browser_press",
+    close: "browser_close",
+    images: "browser_get_images",
+    vision: "browser_vision",
+    read: "read_file",
+    write: "write_file",
     patch: "patch",
-    grep: "search",
-    find: "search",
-    plan: "plan",
-    recall: "recall",
+    grep: "search_files",
+    find: "search_files",
+    plan: "todo",
+    recall: "session_search",
     proc: "process",
     delegate: "delegate",
     todo: "todo",
     memory: "memory",
     clarify: "clarify",
-    session_search: "recall",
+    session_search: "session_search",
     code: "execute",
     execute: "execute",
-    web_search: "search",
-    web_extract: "fetch",
-    browser_navigate: "browser",
-    browser_click: "browser",
-    browser_type: "browser",
-    browser_snapshot: "browser",
-    browser_vision: "browser",
-    browser_scroll: "browser",
-    browser_press: "browser",
-    browser_back: "browser",
-    browser_close: "browser",
-    browser_get_images: "browser",
-    read_file: "read",
+    web_search: "web_search",
+    web_extract: "web_extract",
+    browser_navigate: "browser_navigate",
+    browser_click: "browser_click",
+    browser_type: "browser_type",
+    browser_snapshot: "browser_snapshot",
+    browser_vision: "browser_vision",
+    browser_scroll: "browser_scroll",
+    browser_press: "browser_press",
+    browser_back: "browser_back",
+    browser_close: "browser_close",
+    browser_get_images: "browser_get_images",
+    read_file: "read_file",
     write_file: "write_file",
-    search_files: "search",
+    search_files: "search_files",
     patch_file: "patch",
     execute_code: "execute",
   };
@@ -127,6 +129,17 @@ let toolCallCounter = 0;
 
 function syntheticToolUseId(): string {
   return `hermes-tool-${++toolCallCounter}`;
+}
+
+function compactToolDetail(detail: string, maxLength = 96): string {
+  const oneLine = detail.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLength) return oneLine;
+  return `${oneLine.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function displayToolName(toolInfo: ToolCompletion): string {
+  const detail = compactToolDetail(toolInfo.detail);
+  return detail ? `${toolInfo.name}: ${detail}` : toolInfo.name;
 }
 
 function isThinkingLine(line: string): boolean {
@@ -147,6 +160,7 @@ export interface TranscriptEntry {
   name?: string;
   input?: Record<string, unknown>;
   toolUseId?: string;
+  toolName?: string;
   content?: string;
   isError?: boolean;
   delta?: boolean;
@@ -160,6 +174,60 @@ export interface StdoutParser {
   reset(): void;
 }
 
+function parsePaperclipTranscriptEvent(line: string, ts: string): TranscriptEntry[] | null {
+  if (!line.startsWith(PAPERCLIP_TRANSCRIPT_EVENT_PREFIX)) return null;
+  const raw = line.slice(PAPERCLIP_TRANSCRIPT_EVENT_PREFIX.length).trim();
+  if (!raw) return [];
+
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return [];
+  }
+
+  if (payload.kind === "tool_call") {
+    const name = typeof payload.name === "string" && payload.name.trim()
+      ? payload.name.trim()
+      : "tool";
+    const toolUseId = typeof payload.toolUseId === "string" && payload.toolUseId.trim()
+      ? payload.toolUseId.trim()
+      : syntheticToolUseId();
+    return [{
+      kind: "tool_call",
+      ts,
+      name,
+      input: (payload.input && typeof payload.input === "object" && !Array.isArray(payload.input))
+        ? payload.input as Record<string, unknown>
+        : {},
+      toolUseId,
+    }];
+  }
+
+  if (payload.kind === "tool_result") {
+    const toolUseId = typeof payload.toolUseId === "string" && payload.toolUseId.trim()
+      ? payload.toolUseId.trim()
+      : syntheticToolUseId();
+    const toolName = typeof payload.toolName === "string" && payload.toolName.trim()
+      ? payload.toolName.trim()
+      : typeof payload.name === "string" && payload.name.trim()
+        ? payload.name.trim()
+        : "tool";
+    return [{
+      kind: "tool_result",
+      ts,
+      toolUseId,
+      toolName,
+      content: typeof payload.content === "string" ? payload.content : String(payload.content ?? ""),
+      isError: payload.isError === true,
+    }];
+  }
+
+  return [];
+}
+
 /**
  * Create a stateful stdout parser instance.
  *
@@ -170,6 +238,8 @@ export interface StdoutParser {
 export function createStdoutParser(): StdoutParser {
   let suppressContinuation = false;
   let inDiffBlock = false;
+  let structuredResultsPendingCute = 0;
+  const pendingStructuredToolUseIds: string[] = [];
 
   // ── Pre-tool-invocation suppression ────────────────────────────────────
   let lastWasProse = false;
@@ -224,6 +294,24 @@ export function createStdoutParser(): StdoutParser {
     if (!trimmed) {
       suppressContinuation = false;
       return [];
+    }
+
+    const structuredEntries = parsePaperclipTranscriptEvent(trimmed, ts);
+    if (structuredEntries) {
+      suppressContinuation = false;
+      lastWasProse = false;
+      for (const entry of structuredEntries) {
+        if (entry.kind === "tool_call" && entry.toolUseId) {
+          pendingStructuredToolUseIds.push(entry.toolUseId);
+        } else if (entry.kind === "tool_result") {
+          structuredResultsPendingCute += 1;
+          if (entry.toolUseId) {
+            const index = pendingStructuredToolUseIds.indexOf(entry.toolUseId);
+            if (index >= 0) pendingStructuredToolUseIds.splice(index, 1);
+          }
+        }
+      }
+      return structuredEntries;
     }
 
     // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content) ──
@@ -298,15 +386,26 @@ export function createStdoutParser(): StdoutParser {
 
       const toolInfo = parseToolCompletionLine(trimmed);
       if (toolInfo) {
-        const id = syntheticToolUseId();
+        const name = displayToolName(toolInfo);
         const detailText = toolInfo.duration
           ? `${toolInfo.detail}  ${toolInfo.duration}`
           : toolInfo.detail;
         suppressContinuation = true;
         lastWasProse = false;
+        if (structuredResultsPendingCute > 0) {
+          structuredResultsPendingCute -= 1;
+          return [];
+        }
+        const pendingId = pendingStructuredToolUseIds.shift();
+        if (pendingId) {
+          return [
+            { kind: "tool_result", ts, toolUseId: pendingId, toolName: name, content: detailText, isError: toolInfo.hasError },
+          ];
+        }
+        const id = syntheticToolUseId();
         return [
-          { kind: "tool_call", ts, name: toolInfo.name, input: { detail: toolInfo.detail }, toolUseId: id },
-          { kind: "tool_result", ts, toolUseId: id, content: detailText, isError: toolInfo.hasError },
+          { kind: "tool_call", ts, name, input: { name: toolInfo.name, detail: toolInfo.detail }, toolUseId: id },
+          { kind: "tool_result", ts, toolUseId: id, toolName: name, content: detailText, isError: toolInfo.hasError },
         ];
       }
 
@@ -405,6 +504,8 @@ export function createStdoutParser(): StdoutParser {
   function reset(): void {
     suppressContinuation = false;
     inDiffBlock = false;
+    structuredResultsPendingCute = 0;
+    pendingStructuredToolUseIds.length = 0;
     lastWasProse = false;
     inPreToolBlock = false;
   }

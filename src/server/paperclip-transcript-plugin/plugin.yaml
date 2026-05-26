@@ -1,0 +1,8 @@
+name: paperclip-adapter-events
+version: 1.0.0
+description: Emits structured Paperclip transcript events during Hermes adapter runs.
+author: Paperclip
+kind: standalone
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
